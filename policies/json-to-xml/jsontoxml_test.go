@@ -37,9 +37,9 @@ func TestJSONToXMLPolicy_Mode(t *testing.T) {
 	mode := p.Mode()
 
 	expectedMode := policy.ProcessingMode{
-		RequestHeaderMode:  policy.HeaderModeSkip,
+		RequestHeaderMode:  policy.HeaderModeProcess,
 		RequestBodyMode:    policy.BodyModeBuffer,
-		ResponseHeaderMode: policy.HeaderModeSkip,
+		ResponseHeaderMode: policy.HeaderModeProcess,
 		ResponseBodyMode:   policy.BodyModeBuffer,
 	}
 
@@ -608,7 +608,7 @@ func TestJSONToXMLPolicy_ConvertJSONToXML_EmptyObject(t *testing.T) {
 	}
 
 	xmlStr := string(xmlBytes)
-	if !strings.Contains(xmlStr, "<root>") && !strings.Contains(xmlStr, "</root>") {
+	if !strings.Contains(xmlStr, "<root>") || !strings.Contains(xmlStr, "</root>") {
 		t.Errorf("Expected root element for empty object")
 	}
 }

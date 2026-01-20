@@ -1,4 +1,4 @@
-module github.com/policy-engine/policies/add-headers
+module github.com/wso2/gateway-controllers/policies/add-headers
 
 go 1.25.1
 

@@ -1,4 +1,4 @@
-module github.com/policy-engine/policies/xml-to-json
+module github.com/wso2/gateway-controllers/policies/xml-to-json
 
 go 1.25.1
 

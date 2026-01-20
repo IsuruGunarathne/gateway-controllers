@@ -1,4 +1,4 @@
-module github.com/policy-engine/policies/log-message
+module github.com/wso2/gateway-controllers/policies/log-message
 
 go 1.25.1
 
