@@ -1,0 +1,323 @@
+/*
+ *  Copyright (c) 2026, WSO2 LLC. (http://www.wso2.org) All Rights Reserved.
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ */
+
+// Package azureauthentication implements the azure-authentication policy: it obtains a
+// Microsoft Entra ID access token for the gateway's own Azure identity and injects it into the
+// request before it is forwarded to an Azure-hosted backend such as Azure AI Foundry.
+package azureauthentication
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
+)
+
+const (
+	// AuthenticationTypeWorkloadIdentity exchanges the pod's AKS Workload Identity federated
+	// token for an access token. It is the only authenticationType in this version.
+	AuthenticationTypeWorkloadIdentity = "workload-identity"
+
+	// AuthType is the AuthContext.AuthType value recorded by this policy.
+	AuthType = "azure-workload-identity"
+
+	defaultScope               = "https://ai.azure.com/.default"
+	defaultHeaderName          = "Authorization"
+	defaultValuePrefix         = "Bearer"
+	defaultTokenRequestTimeout = 10 * time.Second
+
+	// maxTokenRequestTimeout keeps a token fetch well inside the ext_proc message timeout.
+	maxTokenRequestTimeout = 30 * time.Second
+
+	failureMessage = "failed to authenticate request to upstream Azure service"
+)
+
+var (
+	// scopePattern accepts a single client-credentials scope: a resource followed by /.default.
+	scopePattern = regexp.MustCompile(`^\S+/\.default$`)
+
+	// headerNamePattern is an RFC 9110 token, which also rules out pseudo-headers.
+	headerNamePattern = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+
+	// entraErrorCodePattern matches an OAuth error code such as invalid_client.
+	entraErrorCodePattern = regexp.MustCompile(`^[a-z_]{1,64}$`)
+
+	// tokenRequestTimeoutPattern is the definition's pattern for tokenRequestTimeout: whole seconds
+	// from 1s to 30s or milliseconds from 1ms to 30000ms. It is checked here too because a value
+	// given through an LLM provider's upstream.auth reaches the policy unvalidated.
+	tokenRequestTimeoutPattern = regexp.MustCompile(`^(([1-9]|[12][0-9]|30)s|([1-9][0-9]{0,3}|[12][0-9]{4}|30000)ms)$`)
+
+	// registry holds the token sources shared by every policy instance in the process.
+	registry = newSourceRegistry()
+
+	// newTokenFetcher builds the client that calls the token endpoint for an identity.
+	newTokenFetcher = func(cfg workloadIdentityConfig) tokenFetcher {
+		return newTokenClient(cfg, sharedTransport())
+	}
+)
+
+// Policy injects an Entra ID access token for the gateway's workload identity into a request
+// header before the request is forwarded upstream.
+type Policy struct {
+	authenticationType string
+	scope              string
+	tenantID           string
+	clientID           string
+	headerName         string
+	valuePrefix        string
+	source             *tokenSource
+}
+
+type params struct {
+	authenticationType  string
+	scope               string
+	clientID            string
+	tenantID            string
+	headerName          string
+	valuePrefix         string
+	tokenRequestTimeout time.Duration
+}
+
+// GetPolicy is the v1alpha2 factory entry point. The policy engine calls it once per route the
+// policy is attached to; instances with the same identity, scope and timeout share one token.
+func GetPolicy(metadata policy.PolicyMetadata, rawParams map[string]interface{}) (policy.Policy, error) {
+	p, err := extractParams(rawParams)
+	if err != nil {
+		return nil, fmt.Errorf("invalid params: %w", err)
+	}
+	cfg, err := resolveWorkloadIdentityConfig(p.clientID, p.tenantID, os.Getenv)
+	if err != nil {
+		return nil, fmt.Errorf("workload identity is not available: %w", err)
+	}
+
+	source := registry.get(sourceKey{cfg: cfg, scope: p.scope, timeout: p.tokenRequestTimeout}, func() *tokenSource {
+		return newTokenSource(newTokenFetcher(cfg), p.scope, p.tokenRequestTimeout,
+			[]any{"tenantId", cfg.tenantID, "clientId", cfg.clientID, "scope", p.scope})
+	})
+
+	slog.Debug("AzureAuthentication: policy initialized", "route", metadata.RouteName, "apiName", metadata.APIName,
+		"authenticationType", p.authenticationType, "tenantId", cfg.tenantID, "clientId", cfg.clientID,
+		"scope", p.scope, "headerName", p.headerName)
+
+	return &Policy{
+		authenticationType: p.authenticationType,
+		scope:              p.scope,
+		tenantID:           cfg.tenantID,
+		clientID:           cfg.clientID,
+		headerName:         p.headerName,
+		valuePrefix:        p.valuePrefix,
+		source:             source,
+	}, nil
+}
+
+func extractParams(raw map[string]interface{}) (params, error) {
+	var p params
+	var err error
+
+	if p.authenticationType, err = requiredString(raw, "authenticationType"); err != nil {
+		return p, err
+	}
+	if p.authenticationType != AuthenticationTypeWorkloadIdentity {
+		return p, fmt.Errorf("'authenticationType' must be %q", AuthenticationTypeWorkloadIdentity)
+	}
+
+	if p.scope, err = optionalString(raw, "scope", defaultScope); err != nil {
+		return p, err
+	}
+	if !scopePattern.MatchString(p.scope) {
+		return p, fmt.Errorf("'scope' must be a single scope ending in /.default, e.g. %s", defaultScope)
+	}
+
+	// clientId and tenantId fall back to the environment; their formats are checked when the
+	// identity is resolved.
+	if p.clientID, err = optionalString(raw, "clientId", ""); err != nil {
+		return p, err
+	}
+	if p.tenantID, err = optionalString(raw, "tenantId", ""); err != nil {
+		return p, err
+	}
+
+	if p.headerName, err = optionalString(raw, "headerName", defaultHeaderName); err != nil {
+		return p, err
+	}
+	if !headerNamePattern.MatchString(p.headerName) {
+		return p, errors.New("'headerName' must be a valid HTTP header name")
+	}
+
+	if p.valuePrefix, err = optionalString(raw, "valuePrefix", defaultValuePrefix); err != nil {
+		return p, err
+	}
+	if strings.ContainsFunc(p.valuePrefix, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return p, errors.New("'valuePrefix' must not contain control characters")
+	}
+
+	timeout, err := optionalString(raw, "tokenRequestTimeout", "")
+	if err != nil {
+		return p, err
+	}
+	p.tokenRequestTimeout = defaultTokenRequestTimeout
+	if timeout != "" {
+		d, err := time.ParseDuration(timeout)
+		if !tokenRequestTimeoutPattern.MatchString(timeout) || err != nil || d > maxTokenRequestTimeout {
+			return p, errors.New("'tokenRequestTimeout' must be whole seconds from 1s to 30s or milliseconds from 1ms to 30000ms, e.g. \"10s\"")
+		}
+		p.tokenRequestTimeout = d
+	}
+	return p, nil
+}
+
+// requiredString returns a trimmed, non-empty string param.
+func requiredString(raw map[string]interface{}, key string) (string, error) {
+	v, ok := raw[key]
+	if !ok {
+		return "", fmt.Errorf("'%s' is required", key)
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("'%s' must be a string", key)
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("'%s' cannot be empty", key)
+	}
+	return s, nil
+}
+
+// optionalString returns a trimmed string param, or def when the key is absent. An explicitly
+// empty string is returned as "" (so valuePrefix: "" means no prefix).
+func optionalString(raw map[string]interface{}, key, def string) (string, error) {
+	v, ok := raw[key]
+	if !ok || v == nil {
+		return def, nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("'%s' must be a string", key)
+	}
+	return strings.TrimSpace(s), nil
+}
+
+// Mode reports that only request headers are processed: the policy sets one header and never
+// needs the body or the response.
+func (p *Policy) Mode() policy.ProcessingMode {
+	return policy.ProcessingMode{
+		RequestHeaderMode:  policy.HeaderModeProcess,
+		RequestBodyMode:    policy.BodyModeSkip,
+		ResponseHeaderMode: policy.HeaderModeSkip,
+		ResponseBodyMode:   policy.BodyModeSkip,
+	}
+}
+
+// OnRequestHeaders injects the access token into headerName.
+func (p *Policy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, _ map[string]interface{}) policy.RequestHeaderAction {
+	tok, err := p.source.Token(ctx)
+	if err != nil {
+		return p.authFailure(reqCtx, err)
+	}
+	p.recordAuth(reqCtx, true)
+	return policy.UpstreamRequestHeaderModifications{
+		HeadersToSet: map[string]string{p.headerName: headerValue(p.valuePrefix, tok.value)},
+	}
+}
+
+func headerValue(prefix, token string) string {
+	if prefix == "" {
+		return token
+	}
+	return prefix + " " + token
+}
+
+// authFailure returns 502: the caller's request was fine, it is the gateway's own upstream
+// credential that could not be obtained. The client sees a generic message; the reason goes to
+// fault policies (Description) and the log.
+func (p *Policy) authFailure(reqCtx *policy.RequestHeaderContext, err error) policy.RequestHeaderAction {
+	reason := faultReason(err)
+	attrs := []any{"reason", reason, "error", err, "tenantId", p.tenantID, "clientId", p.clientID, "scope", p.scope}
+	if reqCtx != nil && reqCtx.SharedContext != nil {
+		attrs = append(attrs, "requestId", reqCtx.RequestID, "apiName", reqCtx.APIName)
+	}
+	slog.Error("AzureAuthentication: could not obtain an access token from Microsoft Entra ID", attrs...)
+
+	p.recordAuth(reqCtx, false)
+
+	body, _ := json.Marshal(map[string]string{"error": "Bad Gateway", "message": failureMessage})
+	return policy.ImmediateResponse{
+		StatusCode: http.StatusBadGateway,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       body,
+		IsFault:    true,
+		Fault: &policy.FaultDetails{
+			Code:        policy.FaultCodeMediationFailed,
+			Type:        policy.FaultTypeMediation,
+			Direction:   policy.DirectionRequest,
+			Message:     failureMessage,
+			Description: reason,
+		},
+	}
+}
+
+// faultReason is a short, client-free description of why no token could be obtained. It names
+// the OAuth error code when Entra returned one, never Entra's error text.
+func faultReason(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timed out obtaining an access token from Microsoft Entra ID"
+	}
+	var e *tokenRequestError
+	if errors.As(err, &e) {
+		switch e.kind {
+		case errKindAssertion:
+			return "the federated service account token could not be read"
+		case errKindTransport:
+			return "the Microsoft Entra ID token endpoint could not be reached"
+		case errKindEndpoint:
+			if entraErrorCodePattern.MatchString(e.code) {
+				return fmt.Sprintf("Microsoft Entra ID rejected the token request (%s)", e.code)
+			}
+			return fmt.Sprintf("the Microsoft Entra ID token endpoint returned HTTP %d", e.status)
+		case errKindResponse:
+			return "the Microsoft Entra ID token endpoint returned an unusable response"
+		}
+	}
+	return "could not obtain an access token from Microsoft Entra ID"
+}
+
+// recordAuth records the outcome in the shared AuthContext, keeping any earlier context (such
+// as the inbound api-key-auth result) as Previous.
+func (p *Policy) recordAuth(reqCtx *policy.RequestHeaderContext, ok bool) {
+	if reqCtx == nil || reqCtx.SharedContext == nil {
+		return
+	}
+	reqCtx.AuthContext = &policy.AuthContext{
+		Authenticated: ok,
+		AuthType:      AuthType,
+		CredentialID:  p.clientID,
+		Properties: map[string]string{
+			"authenticationType": p.authenticationType,
+			"scope":              p.scope,
+			"tenantId":           p.tenantID,
+		},
+		Previous: reqCtx.AuthContext,
+	}
+}
