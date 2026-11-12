@@ -335,16 +335,16 @@ func TestSourceRegistryReusesSourcePerKey(t *testing.T) {
 	}
 	cfg := workloadIdentityConfig{authorityHost: defaultAuthorityHost, tenantID: testTenantID, clientID: testClientID, tokenFile: "/t"}
 
-	a := r.get(sourceKey{cfg: cfg, scope: "https://ai.azure.com/.default", timeout: 10 * time.Second}, build)
-	b := r.get(sourceKey{cfg: cfg, scope: "https://ai.azure.com/.default", timeout: 10 * time.Second}, build)
+	a := r.get(sourceKey{identity: identityConfig{authenticationType: "workload-identity", workload: cfg}, scope: "https://ai.azure.com/.default", timeout: 10 * time.Second}, build)
+	b := r.get(sourceKey{identity: identityConfig{authenticationType: "workload-identity", workload: cfg}, scope: "https://ai.azure.com/.default", timeout: 10 * time.Second}, build)
 	if a != b || builds != 1 {
 		t.Fatalf("same key built %d sources", builds)
 	}
 
-	otherScope := r.get(sourceKey{cfg: cfg, scope: "https://cognitiveservices.azure.com/.default", timeout: 10 * time.Second}, build)
+	otherScope := r.get(sourceKey{identity: identityConfig{authenticationType: "workload-identity", workload: cfg}, scope: "https://cognitiveservices.azure.com/.default", timeout: 10 * time.Second}, build)
 	otherCfg := cfg
 	otherCfg.clientID = "99999999-8888-7777-6666-555555555555"
-	otherClient := r.get(sourceKey{cfg: otherCfg, scope: "https://ai.azure.com/.default", timeout: 10 * time.Second}, build)
+	otherClient := r.get(sourceKey{identity: identityConfig{authenticationType: "workload-identity", workload: otherCfg}, scope: "https://ai.azure.com/.default", timeout: 10 * time.Second}, build)
 	if otherScope == a || otherClient == a || otherScope == otherClient || builds != 3 {
 		t.Fatalf("distinct keys must get distinct sources (builds = %d)", builds)
 	}

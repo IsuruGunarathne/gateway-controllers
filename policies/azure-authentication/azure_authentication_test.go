@@ -41,7 +41,7 @@ func setWorkloadIdentityEnv(t *testing.T, tokenFile string) {
 
 // useFetcher replaces the token endpoint client for one test and gives it an empty registry, so
 // no cached token leaks between tests.
-func useFetcher(t *testing.T, build func(cfg workloadIdentityConfig) tokenFetcher) {
+func useFetcher(t *testing.T, build func(id identityConfig) tokenFetcher) {
 	t.Helper()
 	prevBuild, prevRegistry := newTokenFetcher, registry
 	newTokenFetcher = build
@@ -115,7 +115,7 @@ func captureLogs(t *testing.T) *lockedBuffer {
 
 func TestGetPolicyRejectsInvalidParams(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return staticFetcher("tok") })
+	useFetcher(t, func(identityConfig) tokenFetcher { return staticFetcher("tok") })
 
 	valid := func(extra map[string]interface{}) map[string]interface{} {
 		params := map[string]interface{}{"authenticationType": "workload-identity"}
@@ -167,7 +167,7 @@ func TestGetPolicyRejectsInvalidParams(t *testing.T) {
 
 func TestGetPolicyFailsWithoutWorkloadIdentityEnvironment(t *testing.T) {
 	setWorkloadIdentityEnv(t, "")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return staticFetcher("tok") })
+	useFetcher(t, func(identityConfig) tokenFetcher { return staticFetcher("tok") })
 
 	_, err := GetPolicy(policy.PolicyMetadata{}, map[string]interface{}{"authenticationType": "workload-identity"})
 	if err == nil || !strings.Contains(err.Error(), "AZURE_FEDERATED_TOKEN_FILE") {
@@ -179,7 +179,7 @@ func TestOnRequestHeadersSetsBearerToken(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
 	f := staticFetcher("tok-1")
 	var gotCfg workloadIdentityConfig
-	useFetcher(t, func(cfg workloadIdentityConfig) tokenFetcher { gotCfg = cfg; return f })
+	useFetcher(t, func(id identityConfig) tokenFetcher { gotCfg = id.workload; return f })
 
 	p := mustGetPolicy(t, map[string]interface{}{"authenticationType": "  workload-identity  "})
 	mods := requireHeaderMods(t, p.OnRequestHeaders(context.Background(), newRequestHeaderContext(nil), nil))
@@ -226,7 +226,7 @@ func TestOnRequestHeadersUsesConfiguredHeaderPrefixAndScope(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			setWorkloadIdentityEnv(t, "/token")
 			f := staticFetcher("tok-1")
-			useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return f })
+			useFetcher(t, func(identityConfig) tokenFetcher { return f })
 			tt.params["authenticationType"] = "workload-identity"
 
 			p := mustGetPolicy(t, tt.params)
@@ -245,7 +245,7 @@ func TestOnRequestHeadersUsesConfiguredHeaderPrefixAndScope(t *testing.T) {
 func TestOnRequestHeadersUsesIdentityOverrides(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
 	var gotCfg workloadIdentityConfig
-	useFetcher(t, func(cfg workloadIdentityConfig) tokenFetcher { gotCfg = cfg; return staticFetcher("tok") })
+	useFetcher(t, func(id identityConfig) tokenFetcher { gotCfg = id.workload; return staticFetcher("tok") })
 
 	mustGetPolicy(t, map[string]interface{}{
 		"authenticationType": "workload-identity",
@@ -286,7 +286,7 @@ func TestTokenRequestTimeoutFormats(t *testing.T) {
 func TestTokenRequestTimeoutParamBoundsTheFetch(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
 	f := staticFetcher("tok")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return f })
+	useFetcher(t, func(identityConfig) tokenFetcher { return f })
 
 	p := mustGetPolicy(t, map[string]interface{}{"authenticationType": "workload-identity", "tokenRequestTimeout": "3s"})
 	before := time.Now()
@@ -302,7 +302,7 @@ func TestTokenRequestTimeoutParamBoundsTheFetch(t *testing.T) {
 
 func TestOnRequestHeadersRecordsAuthContext(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return staticFetcher("tok-1") })
+	useFetcher(t, func(identityConfig) tokenFetcher { return staticFetcher("tok-1") })
 	inbound := &policy.AuthContext{Authenticated: true, AuthType: "apikey", CredentialID: "app-1"}
 	shared := &policy.SharedContext{RequestID: "req-1", AuthContext: inbound}
 
@@ -333,7 +333,7 @@ func TestOnRequestHeadersRecordsAuthContext(t *testing.T) {
 
 func TestOnRequestHeadersFailureReturnsDeclaredFault(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher {
+	useFetcher(t, func(identityConfig) tokenFetcher {
 		return &fakeFetcher{respond: func(_ context.Context, _ int) (*accessToken, error) {
 			return nil, &tokenRequestError{
 				kind:        errKindEndpoint,
@@ -387,7 +387,7 @@ func TestOnRequestHeadersFailureReturnsDeclaredFault(t *testing.T) {
 func TestPoliciesWithTheSameIdentityShareOneToken(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
 	f := staticFetcher("tok-1")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return f })
+	useFetcher(t, func(identityConfig) tokenFetcher { return f })
 	params := map[string]interface{}{"authenticationType": "workload-identity"}
 
 	for i := 0; i < 3; i++ { // e.g. three routes of one LLM provider
@@ -405,9 +405,27 @@ func TestPoliciesWithTheSameIdentityShareOneToken(t *testing.T) {
 	}
 }
 
+func TestNewTokenFetcherBuildsTheClientForTheAuthenticationType(t *testing.T) {
+	workload := newTokenFetcher(identityConfig{
+		authenticationType: AuthenticationTypeWorkloadIdentity,
+		workload:           workloadIdentityConfig{authorityHost: defaultAuthorityHost, tenantID: testTenantID, clientID: testClientID, tokenFile: "/t"},
+	})
+	if _, ok := workload.(*tokenClient); !ok {
+		t.Fatalf("workload-identity fetcher = %T, want *tokenClient", workload)
+	}
+
+	managed := newTokenFetcher(identityConfig{
+		authenticationType: "managed-identity",
+		managed:            managedIdentityConfig{endpoint: imdsTokenEndpoint},
+	})
+	if _, ok := managed.(*imdsClient); !ok {
+		t.Fatalf("managed-identity fetcher = %T, want *imdsClient", managed)
+	}
+}
+
 func TestModeProcessesOnlyRequestHeaders(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
-	useFetcher(t, func(workloadIdentityConfig) tokenFetcher { return staticFetcher("tok") })
+	useFetcher(t, func(identityConfig) tokenFetcher { return staticFetcher("tok") })
 
 	got := mustGetPolicy(t, map[string]interface{}{"authenticationType": "workload-identity"}).Mode()
 	want := policy.ProcessingMode{
@@ -435,7 +453,7 @@ func TestEndToEndWithTokenEndpoint(t *testing.T) {
 	})
 	setWorkloadIdentityEnv(t, writeAssertion(t, "federated-token-secret"))
 	t.Setenv("AZURE_AUTHORITY_HOST", f.srv.URL)
-	useFetcher(t, func(cfg workloadIdentityConfig) tokenFetcher { return newTokenClient(cfg, f.srv.Client().Transport) })
+	useFetcher(t, func(id identityConfig) tokenFetcher { return newTokenClient(id.workload, f.srv.Client().Transport) })
 
 	p := mustGetPolicy(t, map[string]interface{}{"authenticationType": "workload-identity"})
 	mods := requireHeaderMods(t, p.OnRequestHeaders(context.Background(), newRequestHeaderContext(nil), nil))
