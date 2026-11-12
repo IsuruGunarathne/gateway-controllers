@@ -20,6 +20,7 @@ package azureauthentication
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -281,6 +282,30 @@ func TestTokenSourceDoesNotCacheTransientFailures(t *testing.T) {
 				t.Fatalf("fetches = %d, want 2", n)
 			}
 		})
+	}
+}
+
+// TestTokenSourceReusesAShortLivedTokenForHalfItsLife: a token with under expiryMargin left when
+// it arrives (IMDS can hand out its cached token near expiry) is served for half its life instead
+// of being fetched again for every request.
+func TestTokenSourceReusesAShortLivedTokenForHalfItsLife(t *testing.T) {
+	clock := &testClock{now: fixedNow}
+	f := &fakeFetcher{respond: func(_ context.Context, n int) (*accessToken, error) {
+		now := clock.Now()
+		return &accessToken{value: fmt.Sprintf("tok-%d", n), expiresOn: now.Add(40 * time.Second), refreshAt: now.Add(20 * time.Second)}, nil
+	}}
+	s := newTestSource(f, clock)
+
+	if got := mustToken(t, s); got != "tok-1" {
+		t.Fatalf("token = %q", got)
+	}
+	clock.Set(fixedNow.Add(10 * time.Second))
+	if got := mustToken(t, s); got != "tok-1" || f.callCount() != 1 {
+		t.Fatalf("token at 10s = %q after %d fetches, want tok-1 after 1", got, f.callCount())
+	}
+	clock.Set(fixedNow.Add(21 * time.Second))
+	if got := mustToken(t, s); got != "tok-2" || f.callCount() != 2 {
+		t.Fatalf("token at 21s = %q after %d fetches, want tok-2 after 2", got, f.callCount())
 	}
 }
 

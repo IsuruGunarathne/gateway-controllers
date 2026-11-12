@@ -210,7 +210,8 @@ there.
      is still returned, and one background refresh starts. If that refresh fails, the current
      token stays in use and the next attempt is made 30 seconds later.
    - With no token, or less than a minute of validity left, the request waits for a new token.
-     Concurrent requests share one token request.
+     Concurrent requests share one token request. A token that arrives with less than a minute
+     left (IMDS can hand out its cached token near expiry) is used for half its remaining life.
 3. A token request reads `AZURE_FEDERATED_TOKEN_FILE` and sends an OAuth 2.0 client credentials
    request with that token as a client assertion to
    `{authority}/{tenant}/oauth2/v2.0/token`. Network errors, `429` and `5xx` are retried up to

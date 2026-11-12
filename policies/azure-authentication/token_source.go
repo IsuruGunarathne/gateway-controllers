@@ -44,10 +44,13 @@ const (
 // tokenSource caches one access token for one identity and scope, and refreshes it.
 //
 //   - fresh (now < refreshAt): the cached token is returned with no network call;
-//   - due (refreshAt <= now < expiresOn - expiryMargin): the cached token is returned and one
-//     background refresh is started, unless one is running or the last one failed less than
+//   - due (refreshAt <= now < usableUntil): the cached token is returned and one background
+//     refresh is started, unless one is running or the last one failed less than
 //     backgroundRetryInterval ago;
-//   - missing or expired: the caller waits for a fetch, shared with every other caller.
+//   - missing or past usableUntil: the caller waits for a fetch, shared with every other caller.
+//
+// usableUntil is expiresOn - expiryMargin, or half way through the token's remaining life if it
+// arrived with less than expiryMargin left, so such a token is not fetched again for every call.
 //
 // Every fetch runs on its own context bounded by timeout, so a cancelled request never aborts a
 // fetch other requests are waiting on. A rejected fetch is returned to callers for about
@@ -61,10 +64,22 @@ type tokenSource struct {
 
 	mu                    sync.Mutex
 	tok                   *accessToken
+	usableUntil           time.Time
 	inFlight              *fetchCall
 	nextBackgroundAttempt time.Time
 	rejection             error
 	rejectionUntil        time.Time
+}
+
+// usableUntil is when a token fetched at fetchedAt stops being sent upstream: expiryMargin before
+// it expires, or half way through its remaining life if that is later.
+func usableUntil(tok *accessToken, fetchedAt time.Time) time.Time {
+	byMargin := tok.expiresOn.Add(-expiryMargin)
+	halfLife := fetchedAt.Add(tok.expiresOn.Sub(fetchedAt) / 2)
+	if halfLife.After(byMargin) {
+		return halfLife
+	}
+	return byMargin
 }
 
 // cachedFailure is a recent rejection returned again without a new token request. It unwraps to
@@ -103,7 +118,7 @@ func newTokenSource(fetcher tokenFetcher, scope string, timeout time.Duration, l
 func (s *tokenSource) Token(ctx context.Context) (*accessToken, error) {
 	s.mu.Lock()
 	now := s.now()
-	if tok := s.tok; tok != nil && now.Before(tok.expiresOn.Add(-expiryMargin)) {
+	if tok := s.tok; tok != nil && now.Before(s.usableUntil) {
 		if !now.Before(tok.refreshAt) && s.inFlight == nil && !now.Before(s.nextBackgroundAttempt) {
 			s.startFetchLocked(true)
 		}
@@ -144,6 +159,7 @@ func (s *tokenSource) startFetchLocked(background bool) *fetchCall {
 		switch {
 		case err == nil:
 			s.tok = tok
+			s.usableUntil = usableUntil(tok, s.now())
 			s.nextBackgroundAttempt = time.Time{}
 			s.rejection = nil
 		case background:
