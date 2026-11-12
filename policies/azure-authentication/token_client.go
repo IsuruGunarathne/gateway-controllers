@@ -245,20 +245,28 @@ func (c *tokenClient) fetchToken(ctx context.Context, scope string) (*accessToke
 	if err != nil {
 		return nil, err
 	}
+	return fetchWithRetry(ctx, maxTokenRetries, c.sleep, func() (*accessToken, error) {
+		return c.requestToken(ctx, scope, assertion)
+	})
+}
 
+// fetchWithRetry calls request until it succeeds, fails with an error that is not retryable, or
+// maxRetries retries are spent, waiting before each retry with retryDelay. It never waits past
+// ctx's deadline: a delay longer than the time left ends the fetch with the last error.
+func fetchWithRetry(ctx context.Context, maxRetries int, sleep func(context.Context, time.Duration) error, request func() (*accessToken, error)) (*accessToken, error) {
 	var lastErr error
-	for attempt := 0; attempt <= maxTokenRetries; attempt++ {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			delay := retryDelay(attempt, lastErr)
 			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 				return nil, lastErr
 			}
-			if err := c.sleep(ctx, delay); err != nil {
+			if err := sleep(ctx, delay); err != nil {
 				return nil, lastErr
 			}
 		}
 
-		tok, err := c.requestToken(ctx, scope, assertion)
+		tok, err := request()
 		if err == nil {
 			return tok, nil
 		}
@@ -301,7 +309,7 @@ func (c *tokenClient) requestToken(ctx context.Context, scope, assertion string)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, newEndpointError(resp, body)
+		return nil, newEndpointError(resp, body, entraRetryable)
 	}
 	return parseTokenResponse(body, issuedAt)
 }
@@ -451,11 +459,18 @@ type errorResponseBody struct {
 	TraceID          string `json:"trace_id"`
 }
 
-func newEndpointError(resp *http.Response, body []byte) *tokenRequestError {
+// entraRetryable reports whether Entra ID's answer is worth retrying: throttling or a server error.
+func entraRetryable(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+// newEndpointError describes an error status from a token endpoint. retryable decides, from the
+// status, whether the request is tried again.
+func newEndpointError(resp *http.Response, body []byte, retryable func(status int) bool) *tokenRequestError {
 	e := &tokenRequestError{
 		kind:      errKindEndpoint,
 		status:    resp.StatusCode,
-		retryable: resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+		retryable: retryable(resp.StatusCode),
 	}
 	var r errorResponseBody
 	if json.Unmarshal(body, &r) == nil {
