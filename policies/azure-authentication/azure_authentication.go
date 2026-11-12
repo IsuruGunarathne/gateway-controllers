@@ -398,8 +398,13 @@ func faultReason(err error, svc tokenService) string {
 		case errKindTransport:
 			return svc.endpoint + " could not be reached"
 		case errKindEndpoint:
-			if entraErrorCodePattern.MatchString(e.code) {
+			hasCode := entraErrorCodePattern.MatchString(e.code)
+			switch {
+			case hasCode && e.status >= 400 && e.status < 500 && e.status != http.StatusTooManyRequests:
 				return fmt.Sprintf("%s rejected the token request (%s)", svc.name, e.code)
+			case hasCode:
+				// Throttling and server errors are transient, not a rejection of the request.
+				return fmt.Sprintf("%s returned HTTP %d (%s)", svc.endpoint, e.status, e.code)
 			}
 			return fmt.Sprintf("%s returned HTTP %d", svc.endpoint, e.status)
 		case errKindResponse:

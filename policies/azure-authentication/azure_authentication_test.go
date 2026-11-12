@@ -505,6 +505,7 @@ func TestWorkloadIdentityFaultReasonsAreUnchanged(t *testing.T) {
 		{"network", &tokenRequestError{kind: errKindTransport, cause: errors.New("dial")}, "the Microsoft Entra ID token endpoint could not be reached"},
 		{"error with a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusUnauthorized, code: "invalid_client"}, "Microsoft Entra ID rejected the token request (invalid_client)"},
 		{"error without a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusServiceUnavailable}, "the Microsoft Entra ID token endpoint returned HTTP 503"},
+		{"server error with a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusServiceUnavailable, code: "temporarily_unavailable"}, "the Microsoft Entra ID token endpoint returned HTTP 503 (temporarily_unavailable)"},
 		{"unusable 200", &tokenRequestError{kind: errKindResponse, status: http.StatusOK, cause: errors.New("no token")}, "the Microsoft Entra ID token endpoint returned an unusable response"},
 		{"anything else", errors.New("boom"), "could not obtain an access token from Microsoft Entra ID"},
 	}
@@ -534,6 +535,7 @@ func TestManagedIdentityFailureNamesIMDS(t *testing.T) {
 	}{
 		{"error with a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusBadRequest, code: "invalid_request", description: "Identity not found"}, "the Azure Instance Metadata Service rejected the token request (invalid_request)"},
 		{"error without a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusGone}, "the Azure Instance Metadata Service returned HTTP 410"},
+		{"throttled with a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusTooManyRequests, code: "throttled"}, "the Azure Instance Metadata Service returned HTTP 429 (throttled)"},
 		{"network", &tokenRequestError{kind: errKindTransport, cause: errors.New("dial")}, "the Azure Instance Metadata Service could not be reached"},
 		{"deadline", context.DeadlineExceeded, "timed out obtaining an access token from the Azure Instance Metadata Service"},
 	}
