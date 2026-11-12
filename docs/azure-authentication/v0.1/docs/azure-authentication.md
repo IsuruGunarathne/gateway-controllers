@@ -32,7 +32,7 @@ typically as the upstream authentication of an LLM provider.
 - Secretless upstream authentication with AKS Workload Identity (user-assigned managed identity),
   or with the managed identity of the VM, VM scale set or AKS node through IMDS
 - Works with any Entra ID–protected resource through a configurable `scope`
-- One cached token per identity and scope, shared by every route and API that uses it
+- One cached token per identity, scope and timeout, shared by every route and API that uses it
 - Background refresh before expiry, so requests don't wait for a new token
 - Retries transient failures (network errors, 429, 5xx, and IMDS's 404 and 410), honouring
   `Retry-After`
@@ -48,7 +48,7 @@ typically as the upstream authentication of an LLM provider.
 |-----------|------|----------|---------|-------------|
 | `authenticationType` | string | Yes | | How the token is obtained: `workload-identity` (AKS Workload Identity) or `managed-identity` (IMDS). |
 | `scope` | string | No | `https://ai.azure.com/.default` | Scope of the access token: the target resource followed by `/.default`. See [Choosing the scope](#choosing-the-scope). |
-| `clientId` | string | No | `AZURE_CLIENT_ID` (`workload-identity`) | Application (client) ID of the managed identity, as a GUID. With `workload-identity`, overrides the environment variable. With `managed-identity`, selects a user-assigned identity of the host; leave it unset for the system-assigned identity. |
+| `clientId` | string | No | `AZURE_CLIENT_ID` (`workload-identity`) | Application (client) ID of the managed identity, as a GUID. With `workload-identity`, overrides the environment variable. With `managed-identity`, selects a user-assigned identity of the host; leave it unset for the host's default identity (its system-assigned identity, or its only user-assigned identity if it has none). |
 | `tenantId` | string | No | `AZURE_TENANT_ID` | Microsoft Entra tenant ID (GUID) or domain name. Overrides the environment variable. `workload-identity` only: setting it with `managed-identity` makes the policy fail to initialize. |
 | `headerName` | string | No | `Authorization` | Request header the token is set in. |
 | `valuePrefix` | string | No | `Bearer` | Prefix placed before the token, separated by a space. An empty string sends the token alone. Control characters are not allowed. |
@@ -59,8 +59,8 @@ There are no system (`config.toml`) parameters.
 ### Environment Variables (Gateway Runtime)
 
 With `workload-identity`, the identity is read from the environment the AKS Workload Identity
-webhook injects into the gateway runtime pod. `managed-identity` reads none of these four
-variables.
+webhook injects into the gateway runtime pod. `managed-identity` reads none of the first four
+variables below; `AZURE_IMDS_TOKEN_ENDPOINT` applies only to `managed-identity`.
 
 | Variable | Required | Description |
 |----------|----------|-------------|
@@ -206,13 +206,14 @@ there.
 2. The policy asks its token cache for a token. There is one cache per identity, scope and
    timeout, shared by every route and API that uses the same combination.
    - A fresh token is returned straight away.
-   - A token that is due for refresh (Entra ID's `refresh_in` hint, or 5 minutes before expiry)
-     is still returned, and one background refresh starts. If that refresh fails, the current
-     token stays in use and the next attempt is made 30 seconds later.
+   - A token that is due for refresh (Entra ID's `refresh_in` hint, 5 minutes before expiry, or
+     half way through its life for a token valid for under 10 minutes) is still returned, and one
+     background refresh starts. If that refresh fails, the current token stays in use and the
+     next attempt is made 30 seconds later.
    - With no token, or less than a minute of validity left, the request waits for a new token.
      Concurrent requests share one token request. A token that arrives with less than a minute
      left (IMDS can hand out its cached token near expiry) is used for half its remaining life.
-3. A token request reads `AZURE_FEDERATED_TOKEN_FILE` and sends an OAuth 2.0 client credentials
+3. With `workload-identity`, a token request reads `AZURE_FEDERATED_TOKEN_FILE` and sends an OAuth 2.0 client credentials
    request with that token as a client assertion to
    `{authority}/{tenant}/oauth2/v2.0/token`. Network errors, `429` and `5xx` are retried up to
    twice with backoff, honouring `Retry-After`, all within `tokenRequestTimeout`. Other errors are

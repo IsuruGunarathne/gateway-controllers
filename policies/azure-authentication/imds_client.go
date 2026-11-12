@@ -53,7 +53,7 @@ var imdsBackoff = backoff{base: time.Second, max: 4 * time.Second}
 // managedIdentityConfig is the managed identity a token is requested for through IMDS.
 type managedIdentityConfig struct {
 	endpoint string // imdsTokenEndpoint, or the AZURE_IMDS_TOKEN_ENDPOINT override; no query
-	clientID string // the user-assigned identity's client ID; "" selects the system-assigned identity
+	clientID string // the user-assigned identity's client ID; "" selects the host's default identity
 }
 
 // resolveManagedIdentityConfig validates the optional clientId param and the endpoint override.
