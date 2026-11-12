@@ -37,11 +37,22 @@ import (
 
 const (
 	// AuthenticationTypeWorkloadIdentity exchanges the pod's AKS Workload Identity federated
-	// token for an access token. It is the only authenticationType in this version.
+	// token for an access token.
 	AuthenticationTypeWorkloadIdentity = "workload-identity"
 
-	// AuthType is the AuthContext.AuthType value recorded by this policy.
+	// AuthenticationTypeManagedIdentity gets the access token from the Azure Instance Metadata
+	// Service (IMDS) for an identity assigned to the VM, VM scale set or AKS node.
+	AuthenticationTypeManagedIdentity = "managed-identity"
+
+	// AuthType is the AuthContext.AuthType value recorded for workload-identity.
 	AuthType = "azure-workload-identity"
+
+	// AuthTypeManagedIdentity is the AuthContext.AuthType value recorded for managed-identity.
+	AuthTypeManagedIdentity = "azure-managed-identity"
+
+	// systemAssignedCredentialID is the AuthContext.CredentialID of the system-assigned identity,
+	// which has no client ID in the configuration.
+	systemAssignedCredentialID = "system-assigned"
 
 	defaultScope               = "https://ai.azure.com/.default"
 	defaultHeaderName          = "Authorization"
@@ -90,8 +101,27 @@ type identityConfig struct {
 	managed            managedIdentityConfig  // set for managed-identity
 }
 
+// tokenService names where a policy's tokens come from, for fault reasons and the failure log.
+type tokenService struct {
+	name     string // e.g. "Microsoft Entra ID"
+	endpoint string // e.g. "the Microsoft Entra ID token endpoint"
+}
+
+var (
+	entraService = tokenService{name: "Microsoft Entra ID", endpoint: "the Microsoft Entra ID token endpoint"}
+	imdsService  = tokenService{name: "the Azure Instance Metadata Service", endpoint: "the Azure Instance Metadata Service"}
+)
+
 // resolveIdentity resolves the identity the policy params and the environment describe.
 func resolveIdentity(p params, getenv func(string) string) (identityConfig, error) {
+	if p.authenticationType == AuthenticationTypeManagedIdentity {
+		cfg, err := resolveManagedIdentityConfig(p.clientID, getenv)
+		if err != nil {
+			return identityConfig{}, fmt.Errorf("managed identity is not available: %w", err)
+		}
+		return identityConfig{authenticationType: AuthenticationTypeManagedIdentity, managed: cfg}, nil
+	}
+
 	cfg, err := resolveWorkloadIdentityConfig(p.clientID, p.tenantID, getenv)
 	if err != nil {
 		return identityConfig{}, fmt.Errorf("workload identity is not available: %w", err)
@@ -99,15 +129,16 @@ func resolveIdentity(p params, getenv func(string) string) (identityConfig, erro
 	return identityConfig{authenticationType: AuthenticationTypeWorkloadIdentity, workload: cfg}, nil
 }
 
-// Policy injects an Entra ID access token for the gateway's workload identity into a request
-// header before the request is forwarded upstream.
+// Policy injects an Entra ID access token for the gateway's workload identity or managed identity
+// into a request header before the request is forwarded upstream.
 type Policy struct {
 	authenticationType string
 	scope              string
-	tenantID           string
-	clientID           string
+	tenantID           string // workload-identity only
+	clientID           string // "" for a system-assigned managed identity
 	headerName         string
 	valuePrefix        string
+	service            tokenService
 	source             *tokenSource
 }
 
@@ -132,26 +163,49 @@ func GetPolicy(metadata policy.PolicyMetadata, rawParams map[string]interface{})
 	if err != nil {
 		return nil, err
 	}
-	cfg := id.workload
 
-	source := registry.get(sourceKey{identity: id, scope: p.scope, timeout: p.tokenRequestTimeout}, func() *tokenSource {
-		return newTokenSource(newTokenFetcher(id), p.scope, p.tokenRequestTimeout,
-			[]any{"tenantId", cfg.tenantID, "clientId", cfg.clientID, "scope", p.scope})
-	})
-
-	slog.Debug("AzureAuthentication: policy initialized", "route", metadata.RouteName, "apiName", metadata.APIName,
-		"authenticationType", p.authenticationType, "tenantId", cfg.tenantID, "clientId", cfg.clientID,
-		"scope", p.scope, "headerName", p.headerName)
-
-	return &Policy{
+	pol := &Policy{
 		authenticationType: p.authenticationType,
 		scope:              p.scope,
-		tenantID:           cfg.tenantID,
-		clientID:           cfg.clientID,
 		headerName:         p.headerName,
 		valuePrefix:        p.valuePrefix,
-		source:             source,
-	}, nil
+	}
+	if id.authenticationType == AuthenticationTypeManagedIdentity {
+		pol.clientID = id.managed.clientID
+		pol.service = imdsService
+	} else {
+		pol.tenantID, pol.clientID = id.workload.tenantID, id.workload.clientID
+		pol.service = entraService
+	}
+	identityAttrs := pol.identityAttrs()
+
+	pol.source = registry.get(sourceKey{identity: id, scope: p.scope, timeout: p.tokenRequestTimeout}, func() *tokenSource {
+		return newTokenSource(newTokenFetcher(id), p.scope, p.tokenRequestTimeout, identityAttrs)
+	})
+
+	slog.Debug("AzureAuthentication: policy initialized", append(append([]any{
+		"route", metadata.RouteName, "apiName", metadata.APIName, "authenticationType", p.authenticationType},
+		identityAttrs...), "headerName", p.headerName)...)
+
+	return pol, nil
+}
+
+// identityAttrs are the log attributes naming the policy's identity and scope: the tenant only
+// for workload-identity, and system-assigned for a managed identity without a client ID.
+func (p *Policy) identityAttrs() []any {
+	if p.authenticationType == AuthenticationTypeManagedIdentity {
+		return []any{"clientId", p.credentialID(), "scope", p.scope}
+	}
+	return []any{"tenantId", p.tenantID, "clientId", p.clientID, "scope", p.scope}
+}
+
+// credentialID is the identity's client ID, or system-assigned for a system-assigned managed
+// identity.
+func (p *Policy) credentialID() string {
+	if p.clientID == "" {
+		return systemAssignedCredentialID
+	}
+	return p.clientID
 }
 
 func extractParams(raw map[string]interface{}) (params, error) {
@@ -161,8 +215,8 @@ func extractParams(raw map[string]interface{}) (params, error) {
 	if p.authenticationType, err = requiredString(raw, "authenticationType"); err != nil {
 		return p, err
 	}
-	if p.authenticationType != AuthenticationTypeWorkloadIdentity {
-		return p, fmt.Errorf("'authenticationType' must be %q", AuthenticationTypeWorkloadIdentity)
+	if p.authenticationType != AuthenticationTypeWorkloadIdentity && p.authenticationType != AuthenticationTypeManagedIdentity {
+		return p, fmt.Errorf("'authenticationType' must be %q or %q", AuthenticationTypeWorkloadIdentity, AuthenticationTypeManagedIdentity)
 	}
 
 	if p.scope, err = optionalString(raw, "scope", defaultScope); err != nil {
@@ -172,13 +226,16 @@ func extractParams(raw map[string]interface{}) (params, error) {
 		return p, fmt.Errorf("'scope' must be a single scope ending in /.default, e.g. %s", defaultScope)
 	}
 
-	// clientId and tenantId fall back to the environment; their formats are checked when the
-	// identity is resolved.
+	// Their formats are checked when the identity is resolved. For workload-identity both fall back
+	// to the environment; a managed identity's tenant comes from the identity itself.
 	if p.clientID, err = optionalString(raw, "clientId", ""); err != nil {
 		return p, err
 	}
 	if p.tenantID, err = optionalString(raw, "tenantId", ""); err != nil {
 		return p, err
+	}
+	if p.authenticationType == AuthenticationTypeManagedIdentity && p.tenantID != "" {
+		return p, fmt.Errorf("'tenantId' is not used with authenticationType %q", AuthenticationTypeManagedIdentity)
 	}
 
 	if p.headerName, err = optionalString(raw, "headerName", defaultHeaderName); err != nil {
@@ -275,12 +332,12 @@ func headerValue(prefix, token string) string {
 // credential that could not be obtained. The client sees a generic message; the reason goes to
 // fault policies (Description) and the log.
 func (p *Policy) authFailure(reqCtx *policy.RequestHeaderContext, err error) policy.RequestHeaderAction {
-	reason := faultReason(err)
-	attrs := []any{"reason", reason, "error", err, "tenantId", p.tenantID, "clientId", p.clientID, "scope", p.scope}
+	reason := faultReason(err, p.service)
+	attrs := append([]any{"reason", reason, "error", err}, p.identityAttrs()...)
 	if reqCtx != nil && reqCtx.SharedContext != nil {
 		attrs = append(attrs, "requestId", reqCtx.RequestID, "apiName", reqCtx.APIName)
 	}
-	slog.Error("AzureAuthentication: could not obtain an access token from Microsoft Entra ID", attrs...)
+	slog.Error("AzureAuthentication: could not obtain an access token from "+p.service.name, attrs...)
 
 	p.recordAuth(reqCtx, false)
 
@@ -300,11 +357,11 @@ func (p *Policy) authFailure(reqCtx *policy.RequestHeaderContext, err error) pol
 	}
 }
 
-// faultReason is a short, client-free description of why no token could be obtained. It names
-// the OAuth error code when Entra returned one, never Entra's error text.
-func faultReason(err error) string {
+// faultReason is a short, client-free description of why no token could be obtained from svc. It
+// names the OAuth error code when the service returned one, never the service's error text.
+func faultReason(err error, svc tokenService) string {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return "timed out obtaining an access token from Microsoft Entra ID"
+		return "timed out obtaining an access token from " + svc.name
 	}
 	var e *tokenRequestError
 	if errors.As(err, &e) {
@@ -312,17 +369,17 @@ func faultReason(err error) string {
 		case errKindAssertion:
 			return "the federated service account token could not be read"
 		case errKindTransport:
-			return "the Microsoft Entra ID token endpoint could not be reached"
+			return svc.endpoint + " could not be reached"
 		case errKindEndpoint:
 			if entraErrorCodePattern.MatchString(e.code) {
-				return fmt.Sprintf("Microsoft Entra ID rejected the token request (%s)", e.code)
+				return fmt.Sprintf("%s rejected the token request (%s)", svc.name, e.code)
 			}
-			return fmt.Sprintf("the Microsoft Entra ID token endpoint returned HTTP %d", e.status)
+			return fmt.Sprintf("%s returned HTTP %d", svc.endpoint, e.status)
 		case errKindResponse:
-			return "the Microsoft Entra ID token endpoint returned an unusable response"
+			return svc.endpoint + " returned an unusable response"
 		}
 	}
-	return "could not obtain an access token from Microsoft Entra ID"
+	return "could not obtain an access token from " + svc.name
 }
 
 // recordAuth records the outcome in the shared AuthContext, keeping any earlier context (such
@@ -331,15 +388,21 @@ func (p *Policy) recordAuth(reqCtx *policy.RequestHeaderContext, ok bool) {
 	if reqCtx == nil || reqCtx.SharedContext == nil {
 		return
 	}
+	authType := AuthType
+	props := map[string]string{
+		"authenticationType": p.authenticationType,
+		"scope":              p.scope,
+	}
+	if p.authenticationType == AuthenticationTypeManagedIdentity {
+		authType = AuthTypeManagedIdentity
+	} else {
+		props["tenantId"] = p.tenantID
+	}
 	reqCtx.AuthContext = &policy.AuthContext{
 		Authenticated: ok,
-		AuthType:      AuthType,
-		CredentialID:  p.clientID,
-		Properties: map[string]string{
-			"authenticationType": p.authenticationType,
-			"scope":              p.scope,
-			"tenantId":           p.tenantID,
-		},
-		Previous: reqCtx.AuthContext,
+		AuthType:      authType,
+		CredentialID:  p.credentialID(),
+		Properties:    props,
+		Previous:      reqCtx.AuthContext,
 	}
 }

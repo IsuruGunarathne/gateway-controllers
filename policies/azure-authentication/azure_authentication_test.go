@@ -20,8 +20,10 @@ package azureauthentication
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -132,7 +134,9 @@ func TestGetPolicyRejectsInvalidParams(t *testing.T) {
 	}{
 		{name: "missing authenticationType", params: map[string]interface{}{}, wantInError: "authenticationType"},
 		{name: "non-string authenticationType", params: map[string]interface{}{"authenticationType": 1}, wantInError: "authenticationType"},
-		{name: "unsupported authenticationType", params: map[string]interface{}{"authenticationType": "managed-identity"}, wantInError: "workload-identity"},
+		{name: "unsupported authenticationType", params: map[string]interface{}{"authenticationType": "client-secret"}, wantInError: "managed-identity"},
+		{name: "managed-identity with tenantId", params: map[string]interface{}{"authenticationType": "managed-identity", "tenantId": "contoso.onmicrosoft.com"}, wantInError: `'tenantId' is not used with authenticationType "managed-identity"`},
+		{name: "managed-identity with a clientId that is not a GUID", params: map[string]interface{}{"authenticationType": "managed-identity", "clientId": "my-app"}, wantInError: "clientId"},
 		{name: "scope without .default", params: valid(map[string]interface{}{"scope": "https://ai.azure.com"}), wantInError: "scope"},
 		{name: "two scopes", params: valid(map[string]interface{}{"scope": "https://ai.azure.com/.default https://graph.microsoft.com/.default"}), wantInError: "scope"},
 		{name: "non-string scope", params: valid(map[string]interface{}{"scope": 42}), wantInError: "scope"},
@@ -402,6 +406,173 @@ func TestPoliciesWithTheSameIdentityShareOneToken(t *testing.T) {
 	requireHeaderMods(t, other.OnRequestHeaders(context.Background(), newRequestHeaderContext(nil), nil))
 	if n := f.callCount(); n != 2 {
 		t.Fatalf("token fetches = %d, want 2 (a different scope needs its own token)", n)
+	}
+}
+
+// failWith returns the response of a policy built from params when every token fetch fails with
+// fetchErr.
+func failWith(t *testing.T, params map[string]interface{}, fetchErr error) policy.ImmediateResponse {
+	t.Helper()
+	useFetcher(t, func(identityConfig) tokenFetcher {
+		return &fakeFetcher{respond: func(_ context.Context, _ int) (*accessToken, error) { return nil, fetchErr }}
+	})
+	action := mustGetPolicy(t, params).OnRequestHeaders(context.Background(), newRequestHeaderContext(nil), nil)
+	resp, ok := action.(policy.ImmediateResponse)
+	if !ok {
+		t.Fatalf("action = %#v, want ImmediateResponse", action)
+	}
+	return resp
+}
+
+// TestWorkloadIdentityFaultReasonsAreUnchanged pins the fault reasons and the failure log line of
+// workload-identity, which the integration suite asserts too.
+func TestWorkloadIdentityFaultReasonsAreUnchanged(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"deadline", context.DeadlineExceeded, "timed out obtaining an access token from Microsoft Entra ID"},
+		{"federated token", &tokenRequestError{kind: errKindAssertion, cause: errors.New("empty")}, "the federated service account token could not be read"},
+		{"network", &tokenRequestError{kind: errKindTransport, cause: errors.New("dial")}, "the Microsoft Entra ID token endpoint could not be reached"},
+		{"error with a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusUnauthorized, code: "invalid_client"}, "Microsoft Entra ID rejected the token request (invalid_client)"},
+		{"error without a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusServiceUnavailable}, "the Microsoft Entra ID token endpoint returned HTTP 503"},
+		{"unusable 200", &tokenRequestError{kind: errKindResponse, status: http.StatusOK, cause: errors.New("no token")}, "the Microsoft Entra ID token endpoint returned an unusable response"},
+		{"anything else", errors.New("boom"), "could not obtain an access token from Microsoft Entra ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setWorkloadIdentityEnv(t, "/token")
+			logs := captureLogs(t)
+			resp := failWith(t, map[string]interface{}{"authenticationType": "workload-identity"}, tt.err)
+			if resp.Fault == nil || resp.Fault.Description != tt.want {
+				t.Fatalf("fault = %+v, want description %q", resp.Fault, tt.want)
+			}
+			if !strings.Contains(logs.String(), "AzureAuthentication: could not obtain an access token from Microsoft Entra ID") {
+				t.Fatalf("log does not have the Entra ID failure line:\n%s", logs)
+			}
+		})
+	}
+}
+
+func TestManagedIdentityFailureNamesIMDS(t *testing.T) {
+	setWorkloadIdentityEnv(t, "/token")
+	workload := failWith(t, map[string]interface{}{"authenticationType": "workload-identity"}, errors.New("boom"))
+
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"error with a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusBadRequest, code: "invalid_request", description: "Identity not found"}, "the Azure Instance Metadata Service rejected the token request (invalid_request)"},
+		{"error without a code", &tokenRequestError{kind: errKindEndpoint, status: http.StatusGone}, "the Azure Instance Metadata Service returned HTTP 410"},
+		{"network", &tokenRequestError{kind: errKindTransport, cause: errors.New("dial")}, "the Azure Instance Metadata Service could not be reached"},
+		{"deadline", context.DeadlineExceeded, "timed out obtaining an access token from the Azure Instance Metadata Service"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			resp := failWith(t, map[string]interface{}{"authenticationType": "managed-identity", "clientId": testClientID}, tt.err)
+			if resp.StatusCode != workload.StatusCode || !reflect.DeepEqual(resp.Headers, workload.Headers) || !bytes.Equal(resp.Body, workload.Body) {
+				t.Fatalf("response = %d %v %s, want the workload-identity failure %d %v %s",
+					resp.StatusCode, resp.Headers, resp.Body, workload.StatusCode, workload.Headers, workload.Body)
+			}
+			if !resp.IsFault || resp.Fault == nil || resp.Fault.Code != policy.FaultCodeMediationFailed {
+				t.Fatalf("fault = %+v, want a declared %s", resp.Fault, policy.FaultCodeMediationFailed)
+			}
+			if resp.Fault.Description != tt.want {
+				t.Fatalf("description = %q, want %q", resp.Fault.Description, tt.want)
+			}
+			if !strings.Contains(logs.String(), "could not obtain an access token from the Azure Instance Metadata Service") {
+				t.Fatalf("log does not name IMDS:\n%s", logs)
+			}
+		})
+	}
+}
+
+func TestGetPolicyBuildsManagedIdentityWithoutWorkloadIdentityEnvironment(t *testing.T) {
+	setWorkloadIdentityEnv(t, "")
+	t.Setenv("AZURE_TENANT_ID", "")
+	t.Setenv("AZURE_CLIENT_ID", "")
+	t.Setenv("AZURE_IMDS_TOKEN_ENDPOINT", "")
+	var got identityConfig
+	useFetcher(t, func(id identityConfig) tokenFetcher { got = id; return staticFetcher("tok") })
+
+	mustGetPolicy(t, map[string]interface{}{"authenticationType": "managed-identity"})
+	want := identityConfig{authenticationType: "managed-identity", managed: managedIdentityConfig{endpoint: imdsTokenEndpoint}}
+	if got != want {
+		t.Fatalf("identity = %+v, want %+v", got, want)
+	}
+}
+
+func TestManagedIdentityIgnoresWorkloadIdentityEnvironment(t *testing.T) {
+	setWorkloadIdentityEnv(t, "/token")
+	var got identityConfig
+	useFetcher(t, func(id identityConfig) tokenFetcher { got = id; return staticFetcher("tok") })
+
+	mustGetPolicy(t, map[string]interface{}{"authenticationType": "managed-identity"})
+	if got.authenticationType != "managed-identity" || got.managed.clientID != "" {
+		t.Fatalf("identity = %+v, want the system-assigned identity, not AZURE_CLIENT_ID", got)
+	}
+}
+
+func TestManagedIdentityUsesClientIDParam(t *testing.T) {
+	var got identityConfig
+	useFetcher(t, func(id identityConfig) tokenFetcher { got = id; return staticFetcher("tok") })
+
+	mustGetPolicy(t, map[string]interface{}{"authenticationType": "managed-identity", "clientId": "11111111-2222-3333-4444-555555555555"})
+	if got.managed.clientID != "11111111-2222-3333-4444-555555555555" {
+		t.Fatalf("identity = %+v, want the clientId param", got)
+	}
+}
+
+func TestOnRequestHeadersRecordsManagedIdentityAuthContext(t *testing.T) {
+	tests := []struct {
+		name             string
+		params           map[string]interface{}
+		wantCredentialID string
+	}{
+		{"user-assigned", map[string]interface{}{"authenticationType": "managed-identity", "clientId": testClientID}, testClientID},
+		{"system-assigned", map[string]interface{}{"authenticationType": "managed-identity"}, "system-assigned"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			useFetcher(t, func(identityConfig) tokenFetcher { return staticFetcher("tok-1") })
+			inbound := &policy.AuthContext{Authenticated: true, AuthType: "apikey", CredentialID: "app-1"}
+			shared := &policy.SharedContext{RequestID: "req-1", AuthContext: inbound}
+
+			p := mustGetPolicy(t, tt.params)
+			requireHeaderMods(t, p.OnRequestHeaders(context.Background(), newRequestHeaderContext(shared), nil))
+
+			got := shared.AuthContext
+			if got == nil || !got.Authenticated || got.AuthType != "azure-managed-identity" || got.CredentialID != tt.wantCredentialID {
+				t.Fatalf("AuthContext = %+v", got)
+			}
+			wantProps := map[string]string{"authenticationType": "managed-identity", "scope": "https://ai.azure.com/.default"}
+			if !reflect.DeepEqual(got.Properties, wantProps) {
+				t.Fatalf("Properties = %v, want %v", got.Properties, wantProps)
+			}
+			if got.Previous != inbound {
+				t.Fatal("the inbound AuthContext was not kept as Previous")
+			}
+		})
+	}
+}
+
+func TestWorkloadAndManagedIdentitiesDoNotShareTokens(t *testing.T) {
+	setWorkloadIdentityEnv(t, "/token")
+	f := staticFetcher("tok")
+	useFetcher(t, func(identityConfig) tokenFetcher { return f })
+
+	for _, params := range []map[string]interface{}{
+		{"authenticationType": "workload-identity"},
+		{"authenticationType": "managed-identity"},
+	} {
+		p := mustGetPolicy(t, params)
+		requireHeaderMods(t, p.OnRequestHeaders(context.Background(), newRequestHeaderContext(nil), nil))
+	}
+	if n := f.callCount(); n != 2 {
+		t.Fatalf("token fetches = %d, want 2 (each authentication type has its own token)", n)
 	}
 }
 
