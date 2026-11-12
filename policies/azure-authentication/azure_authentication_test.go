@@ -651,16 +651,25 @@ func TestNewTokenFetcherBuildsTheClientForTheAuthenticationType(t *testing.T) {
 		authenticationType: AuthenticationTypeWorkloadIdentity,
 		workload:           workloadIdentityConfig{authorityHost: defaultAuthorityHost, tenantID: testTenantID, clientID: testClientID, tokenFile: "/t"},
 	})
-	if _, ok := workload.(*tokenClient); !ok {
+	entra, ok := workload.(*tokenClient)
+	if !ok {
 		t.Fatalf("workload-identity fetcher = %T, want *tokenClient", workload)
+	}
+	if entra.httpClient.Transport != sharedTransport() {
+		t.Fatal("the workload-identity client must use the shared Entra transport")
 	}
 
 	managed := newTokenFetcher(identityConfig{
 		authenticationType: "managed-identity",
 		managed:            managedIdentityConfig{endpoint: imdsTokenEndpoint},
 	})
-	if _, ok := managed.(*imdsClient); !ok {
+	imds, ok := managed.(*imdsClient)
+	if !ok {
 		t.Fatalf("managed-identity fetcher = %T, want *imdsClient", managed)
+	}
+	// IMDS requests must never go through HTTP(S)_PROXY, which the Entra transport honours.
+	if imds.httpClient.Transport != imdsTransport() {
+		t.Fatal("the managed-identity client must use the proxy-free IMDS transport")
 	}
 }
 

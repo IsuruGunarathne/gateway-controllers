@@ -90,6 +90,7 @@ func TestResolveManagedIdentityConfigRejectsUnusableConfiguration(t *testing.T) 
 		{name: "override with a fragment", override: "https://h/t#f", wantInError: overrideError},
 		{name: "override without a host", override: "https:///t", wantInError: overrideError},
 		{name: "unparsable override", override: "::", wantInError: overrideError},
+		{name: "override with an empty query", override: "https://h/t?", wantInError: overrideError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -367,6 +368,20 @@ func TestIMDSFetchDoesNotFollowRedirects(t *testing.T) {
 	}
 	if n := len(elsewhere.requests()); n != 0 {
 		t.Fatalf("the redirect target got %d requests, want 0", n)
+	}
+}
+
+func TestIMDSFetchRejectsAnOversizedResponse(t *testing.T) {
+	f := newFakeIMDS(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"token_type":"Bearer","expires_in":"3599","access_token":"`+strings.Repeat("a", maxTokenResponseBytes)+`"}`)
+	})
+	c, _ := newTestIMDSClient(f, testClientID)
+
+	_, err := c.fetchToken(context.Background(), "https://ai.azure.com/.default")
+	var e *tokenRequestError
+	if !errors.As(err, &e) || e.kind != errKindResponse || !strings.Contains(err.Error(), "exceeds 1 MiB") {
+		t.Fatalf("error = %v, want an unusable response that exceeds 1 MiB", err)
 	}
 }
 
