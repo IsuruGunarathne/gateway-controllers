@@ -208,6 +208,10 @@ func (p *Policy) credentialID() string {
 	return p.clientID
 }
 
+// extractParams reads and checks the policy params. It is the only check for params given in an
+// LLM provider's upstream.auth, which the controller does not validate. It is slightly more
+// lenient than the policy definition, which the controller applies to APIs: string values are
+// trimmed, and an empty or null optional value means its default.
 func extractParams(raw map[string]interface{}) (params, error) {
 	var p params
 	var err error
