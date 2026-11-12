@@ -313,6 +313,9 @@ func (p *Policy) Mode() policy.ProcessingMode {
 func (p *Policy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, _ map[string]interface{}) policy.RequestHeaderAction {
 	tok, err := p.source.Token(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return p.requestEnded(reqCtx)
+		}
 		return p.authFailure(reqCtx, err)
 	}
 	p.recordAuth(reqCtx, true)
@@ -346,7 +349,25 @@ func (p *Policy) authFailure(reqCtx *policy.RequestHeaderContext, err error) pol
 	slog.Log(context.Background(), level, "AzureAuthentication: could not obtain an access token from "+p.service.name, attrs...)
 
 	p.recordAuth(reqCtx, false)
+	return failureResponse(reason)
+}
 
+// requestEnded answers a request whose own context ended while it waited for a token, such as a
+// client that disconnected. It is not an Entra ID or IMDS failure, so it is logged at Debug and
+// leaves the AuthContext as it was.
+func (p *Policy) requestEnded(reqCtx *policy.RequestHeaderContext) policy.RequestHeaderAction {
+	const reason = "the request ended before an access token was available"
+	attrs := append([]any{"reason", reason}, p.identityAttrs()...)
+	if reqCtx != nil && reqCtx.SharedContext != nil {
+		attrs = append(attrs, "requestId", reqCtx.RequestID, "apiName", reqCtx.APIName)
+	}
+	slog.Debug("AzureAuthentication: "+reason, attrs...)
+	return failureResponse(reason)
+}
+
+// failureResponse is the 502 the policy answers when it has no token for the upstream request,
+// with reason as the fault's internal description.
+func failureResponse(reason string) policy.ImmediateResponse {
 	body, _ := json.Marshal(map[string]string{"error": "Bad Gateway", "message": failureMessage})
 	return policy.ImmediateResponse{
 		StatusCode: http.StatusBadGateway,

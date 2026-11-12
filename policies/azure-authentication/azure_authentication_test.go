@@ -388,6 +388,44 @@ func TestOnRequestHeadersFailureReturnsDeclaredFault(t *testing.T) {
 	}
 }
 
+// TestARequestThatEndsFirstIsNotAnIdentityFailure: a caller that leaves before the token arrives is
+// not an Entra ID or IMDS failure, so it is logged at Debug with its own reason and does not mark
+// the request unauthenticated.
+func TestARequestThatEndsFirstIsNotAnIdentityFailure(t *testing.T) {
+	setWorkloadIdentityEnv(t, "/token")
+	logs := captureLogs(t)
+	release := make(chan struct{})
+	useFetcher(t, func(identityConfig) tokenFetcher {
+		return &fakeFetcher{respond: func(ctx context.Context, _ int) (*accessToken, error) {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil, errors.New("never answered")
+		}}
+	})
+	t.Cleanup(func() { close(release) })
+	inbound := &policy.AuthContext{Authenticated: true, AuthType: "apikey"}
+	shared := &policy.SharedContext{RequestID: "req-1", AuthContext: inbound}
+	p := mustGetPolicy(t, map[string]interface{}{"authenticationType": "workload-identity"})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	resp, ok := p.OnRequestHeaders(ctx, newRequestHeaderContext(shared), nil).(policy.ImmediateResponse)
+	if !ok || resp.StatusCode != http.StatusBadGateway || !resp.IsFault || resp.Fault == nil {
+		t.Fatalf("response = %+v, want a declared 502", resp)
+	}
+	if resp.Fault.Description != "the request ended before an access token was available" {
+		t.Fatalf("description = %q", resp.Fault.Description)
+	}
+	if strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("a request that ended first was logged as an error:\n%s", logs)
+	}
+	if shared.AuthContext != inbound {
+		t.Fatalf("AuthContext = %+v, want the inbound one untouched", shared.AuthContext)
+	}
+}
+
 // TestARejectionIsLoggedOnceWhileCached: requests that get a cached rejection fail the same way
 // but log at Debug, so a misconfigured identity logs one ERROR per token request, not per request.
 func TestARejectionIsLoggedOnceWhileCached(t *testing.T) {
