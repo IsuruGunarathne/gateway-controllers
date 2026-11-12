@@ -72,11 +72,32 @@ var (
 	// registry holds the token sources shared by every policy instance in the process.
 	registry = newSourceRegistry()
 
-	// newTokenFetcher builds the client that calls the token endpoint for an identity.
-	newTokenFetcher = func(cfg workloadIdentityConfig) tokenFetcher {
-		return newTokenClient(cfg, sharedTransport())
+	// newTokenFetcher builds the client that obtains tokens for an identity: the Entra ID token
+	// endpoint for a workload identity, IMDS for a managed identity.
+	newTokenFetcher = func(id identityConfig) tokenFetcher {
+		if id.authenticationType == AuthenticationTypeWorkloadIdentity {
+			return newTokenClient(id.workload, sharedTransport())
+		}
+		return newIMDSClient(id.managed, imdsTransport())
 	}
 )
+
+// identityConfig is the resolved identity of a policy instance. Only the field for its
+// authenticationType is set, so the struct is comparable and serves as part of a token cache key.
+type identityConfig struct {
+	authenticationType string
+	workload           workloadIdentityConfig // set for workload-identity
+	managed            managedIdentityConfig  // set for managed-identity
+}
+
+// resolveIdentity resolves the identity the policy params and the environment describe.
+func resolveIdentity(p params, getenv func(string) string) (identityConfig, error) {
+	cfg, err := resolveWorkloadIdentityConfig(p.clientID, p.tenantID, getenv)
+	if err != nil {
+		return identityConfig{}, fmt.Errorf("workload identity is not available: %w", err)
+	}
+	return identityConfig{authenticationType: AuthenticationTypeWorkloadIdentity, workload: cfg}, nil
+}
 
 // Policy injects an Entra ID access token for the gateway's workload identity into a request
 // header before the request is forwarded upstream.
@@ -107,13 +128,14 @@ func GetPolicy(metadata policy.PolicyMetadata, rawParams map[string]interface{})
 	if err != nil {
 		return nil, fmt.Errorf("invalid params: %w", err)
 	}
-	cfg, err := resolveWorkloadIdentityConfig(p.clientID, p.tenantID, os.Getenv)
+	id, err := resolveIdentity(p, os.Getenv)
 	if err != nil {
-		return nil, fmt.Errorf("workload identity is not available: %w", err)
+		return nil, err
 	}
+	cfg := id.workload
 
-	source := registry.get(sourceKey{cfg: cfg, scope: p.scope, timeout: p.tokenRequestTimeout}, func() *tokenSource {
-		return newTokenSource(newTokenFetcher(cfg), p.scope, p.tokenRequestTimeout,
+	source := registry.get(sourceKey{identity: id, scope: p.scope, timeout: p.tokenRequestTimeout}, func() *tokenSource {
+		return newTokenSource(newTokenFetcher(id), p.scope, p.tokenRequestTimeout,
 			[]any{"tenantId", cfg.tenantID, "clientId", cfg.clientID, "scope", p.scope})
 	})
 

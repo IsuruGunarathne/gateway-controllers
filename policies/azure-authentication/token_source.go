@@ -131,9 +131,9 @@ func (s *tokenSource) startFetchLocked(background bool) *fetchCall {
 // sourceKey identifies a shared token source: the same identity, scope and timeout always map to
 // the same cached token, across routes and across config pushes that rebuild policy instances.
 type sourceKey struct {
-	cfg     workloadIdentityConfig
-	scope   string
-	timeout time.Duration
+	identity identityConfig
+	scope    string
+	timeout  time.Duration
 }
 
 // sourceRegistry is the process-wide set of token sources.
