@@ -377,6 +377,13 @@ to fault policies and analytics only, never to the client.
   namespace and service account, so no other workload can use the identity.
 - **Identity overrides**: `clientId` lets an API choose any identity federated with the gateway's
   service account. Federate only identities that every API on the gateway may use.
+- **Who configures the policy controls the token**: whoever creates an API or LLM provider with
+  this policy chooses the identity (`clientId`), the scope (any resource's `/.default`, such as
+  `https://management.azure.com/.default`) and the upstream URL the token is sent to. They can
+  therefore obtain a token for any identity the gateway can use, for any resource that identity
+  can access, and send it to a server of their choosing; with `managed-identity` on AKS, that
+  includes the node's identities. Give the gateway's identities only the roles its APIs need, and
+  allow only trusted users to create APIs and LLM providers on a gateway that uses this policy.
 - **No stored secret**: nothing is stored in the API definition, and the projected token is short
   lived and rotated by Kubernetes.
 - **HTTPS only**: the authority host must use `https`, and token requests never follow redirects.
