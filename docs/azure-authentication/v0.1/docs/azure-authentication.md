@@ -221,8 +221,9 @@ there.
    `http://169.254.169.254/metadata/identity/oauth2/token` with `api-version=2018-02-01`, the
    scope's resource (the scope without `/.default`), `client_id` when `clientId` is set, and the
    `Metadata: true` header. Network errors, `404`, `410`, `429` and `5xx` are retried up to four
-   times with backoff, honouring `Retry-After`, all within `tokenRequestTimeout`. Other errors are
-   not retried, redirects are never followed, and no proxy is used.
+   times, after waiting about 1, 2, 4 and 4 seconds (longer when IMDS sends `Retry-After`), all
+   within `tokenRequestTimeout`. With the default `10s` timeout, about three retries fit. Other
+   errors are not retried, redirects are never followed, and no proxy is used.
 4. The token is set in `headerName` (`Authorization: Bearer <token>` by default) and the request
    is forwarded upstream.
 5. If no token can be obtained, the request is short-circuited with `502 Bad Gateway`: it is the

@@ -293,6 +293,34 @@ func TestIMDSFetchGivesUpAfterFourRetries(t *testing.T) {
 	}
 }
 
+// requireDelays checks each recorded delay against the schedule: at least the scheduled delay and
+// at most half again of it, the jitter.
+func requireDelays(t *testing.T, got []time.Duration, schedule ...time.Duration) {
+	t.Helper()
+	if len(got) != len(schedule) {
+		t.Fatalf("delays = %v, want %d of them", got, len(schedule))
+	}
+	for i, want := range schedule {
+		if got[i] < want || got[i] > want+want/2 {
+			t.Fatalf("delay %d = %v, want between %v and %v (delays %v)", i+1, got[i], want, want+want/2, got)
+		}
+	}
+}
+
+// TestIMDSFetchWaitsAtLeastASecondBetweenRetries pins the IMDS schedule: Microsoft asks for at
+// least a second before retrying IMDS, and faster retries get throttled.
+func TestIMDSFetchWaitsAtLeastASecondBetweenRetries(t *testing.T) {
+	f := newFakeIMDS(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	c, sleeps := newTestIMDSClient(f, testClientID)
+
+	if _, err := c.fetchToken(context.Background(), "https://ai.azure.com/.default"); err == nil {
+		t.Fatal("expected an error")
+	}
+	requireDelays(t, sleeps.delays, time.Second, 2*time.Second, 4*time.Second, 4*time.Second)
+}
+
 func TestIMDSFetchHonoursRetryAfter(t *testing.T) {
 	f := newFakeIMDS(t, func(n int, w http.ResponseWriter, r *http.Request) {
 		if n == 1 {

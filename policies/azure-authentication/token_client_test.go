@@ -515,6 +515,20 @@ func TestFetchTokenRetriesServerError(t *testing.T) {
 	}
 }
 
+// TestFetchTokenBacksOffFrom200ms pins the Entra ID schedule, which IMDS's slower one must not
+// change.
+func TestFetchTokenBacksOffFrom200ms(t *testing.T) {
+	f := newFakeEntra(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	c, sleeps := newTestClient(f, writeAssertion(t, "jwt"))
+
+	if _, err := c.fetchToken(context.Background(), "https://ai.azure.com/.default"); err == nil {
+		t.Fatal("expected an error")
+	}
+	requireDelays(t, sleeps.delays, 200*time.Millisecond, 400*time.Millisecond)
+}
+
 func TestFetchTokenGivesUpAfterTwoRetries(t *testing.T) {
 	f := newFakeEntra(t, func(_ int, w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)

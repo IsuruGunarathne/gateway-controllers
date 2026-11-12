@@ -64,11 +64,6 @@ const (
 	// maxTokenRetries is how many times a transient failure (network error, 429, 5xx) is retried.
 	maxTokenRetries = 2
 
-	// retryBaseDelay and retryMaxDelay bound the exponential backoff between retries; jitter
-	// keeps gateway replicas from retrying in lockstep.
-	retryBaseDelay = 200 * time.Millisecond
-	retryMaxDelay  = 2 * time.Second
-
 	// refreshLead is how long before expiry a token is refreshed when the response carries no
 	// refresh_in hint. Tokens living less than shortLivedTokenLifetime refresh at half-life.
 	refreshLead             = 5 * time.Minute
@@ -245,19 +240,19 @@ func (c *tokenClient) fetchToken(ctx context.Context, scope string) (*accessToke
 	if err != nil {
 		return nil, err
 	}
-	return fetchWithRetry(ctx, maxTokenRetries, c.sleep, func() (*accessToken, error) {
+	return fetchWithRetry(ctx, maxTokenRetries, entraBackoff, c.sleep, func() (*accessToken, error) {
 		return c.requestToken(ctx, scope, assertion)
 	})
 }
 
 // fetchWithRetry calls request until it succeeds, fails with an error that is not retryable, or
-// maxRetries retries are spent, waiting before each retry with retryDelay. It never waits past
-// ctx's deadline: a delay longer than the time left ends the fetch with the last error.
-func fetchWithRetry(ctx context.Context, maxRetries int, sleep func(context.Context, time.Duration) error, request func() (*accessToken, error)) (*accessToken, error) {
+// maxRetries retries are spent, waiting before each retry as the schedule says. It never waits
+// past ctx's deadline: a delay longer than the time left ends the fetch with the last error.
+func fetchWithRetry(ctx context.Context, maxRetries int, schedule backoff, sleep func(context.Context, time.Duration) error, request func() (*accessToken, error)) (*accessToken, error) {
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			delay := retryDelay(attempt, lastErr)
+			delay := schedule.delay(attempt, lastErr)
 			if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 				return nil, lastErr
 			}
@@ -507,18 +502,28 @@ func isRetryable(err error) bool {
 	return errors.As(err, &e) && e.retryable
 }
 
-// retryDelay is exponential backoff with jitter, or the endpoint's Retry-After when longer.
-func retryDelay(attempt int, lastErr error) time.Duration {
-	backoff := retryBaseDelay << (attempt - 1)
-	if backoff > retryMaxDelay || backoff <= 0 {
-		backoff = retryMaxDelay
+// backoff is a retry delay schedule: the first retry waits base, each later one twice the last up
+// to max, plus up to half again of jitter, which keeps gateway replicas from retrying in lockstep.
+type backoff struct {
+	base time.Duration
+	max  time.Duration
+}
+
+// entraBackoff paces retries of the Entra ID token endpoint.
+var entraBackoff = backoff{base: 200 * time.Millisecond, max: 2 * time.Second}
+
+// delay is the wait before the given retry (1-based), or the endpoint's Retry-After when longer.
+func (b backoff) delay(attempt int, lastErr error) time.Duration {
+	d := b.base << (attempt - 1)
+	if d > b.max || d <= 0 {
+		d = b.max
 	}
-	backoff += rand.N(backoff/2 + 1)
+	d += rand.N(d/2 + 1)
 	var e *tokenRequestError
-	if errors.As(lastErr, &e) && e.retryAfter > backoff {
+	if errors.As(lastErr, &e) && e.retryAfter > d {
 		return e.retryAfter
 	}
-	return backoff
+	return d
 }
 
 func truncate(s string, n int) string {

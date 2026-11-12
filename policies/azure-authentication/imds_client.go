@@ -46,6 +46,10 @@ const (
 	maxIMDSRetries = 4
 )
 
+// imdsBackoff paces IMDS retries more slowly than Entra ID's: Microsoft asks for at least a second
+// before retrying IMDS, and faster retries get throttled. The waits are 1 s, 2 s, 4 s and 4 s.
+var imdsBackoff = backoff{base: time.Second, max: 4 * time.Second}
+
 // managedIdentityConfig is the managed identity a token is requested for through IMDS.
 type managedIdentityConfig struct {
 	endpoint string // imdsTokenEndpoint, or the AZURE_IMDS_TOKEN_ENDPOINT override; no query
@@ -125,7 +129,7 @@ func newIMDSClient(cfg managedIdentityConfig, transport http.RoundTripper) *imds
 // transient. It never waits past ctx's deadline.
 func (c *imdsClient) fetchToken(ctx context.Context, scope string) (*accessToken, error) {
 	resource := resourceFromScope(scope)
-	return fetchWithRetry(ctx, maxIMDSRetries, c.sleep, func() (*accessToken, error) {
+	return fetchWithRetry(ctx, maxIMDSRetries, imdsBackoff, c.sleep, func() (*accessToken, error) {
 		return c.requestToken(ctx, resource)
 	})
 }
