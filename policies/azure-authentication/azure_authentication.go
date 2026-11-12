@@ -50,9 +50,10 @@ const (
 	// AuthTypeManagedIdentity is the AuthContext.AuthType value recorded for managed-identity.
 	AuthTypeManagedIdentity = "azure-managed-identity"
 
-	// systemAssignedCredentialID is the AuthContext.CredentialID of the system-assigned identity,
-	// which has no client ID in the configuration.
-	systemAssignedCredentialID = "system-assigned"
+	// hostDefaultCredentialID is the AuthContext.CredentialID of a managed identity without a
+	// clientId. IMDS then uses the host's system-assigned identity or, if the host has none, its
+	// only user-assigned identity, so the policy does not know which one it is.
+	hostDefaultCredentialID = "host-default"
 
 	defaultScope               = "https://ai.azure.com/.default"
 	defaultHeaderName          = "Authorization"
@@ -135,7 +136,7 @@ type Policy struct {
 	authenticationType string
 	scope              string
 	tenantID           string // workload-identity only
-	clientID           string // "" for a system-assigned managed identity
+	clientID           string // "" for a managed identity without clientId: the host's default
 	headerName         string
 	valuePrefix        string
 	service            tokenService
@@ -191,7 +192,7 @@ func GetPolicy(metadata policy.PolicyMetadata, rawParams map[string]interface{})
 }
 
 // identityAttrs are the log attributes naming the policy's identity and scope: the tenant only
-// for workload-identity, and system-assigned for a managed identity without a client ID.
+// for workload-identity, and host-default for a managed identity without a client ID.
 func (p *Policy) identityAttrs() []any {
 	if p.authenticationType == AuthenticationTypeManagedIdentity {
 		return []any{"clientId", p.credentialID(), "scope", p.scope}
@@ -199,11 +200,10 @@ func (p *Policy) identityAttrs() []any {
 	return []any{"tenantId", p.tenantID, "clientId", p.clientID, "scope", p.scope}
 }
 
-// credentialID is the identity's client ID, or system-assigned for a system-assigned managed
-// identity.
+// credentialID is the identity's client ID, or host-default for a managed identity without one.
 func (p *Policy) credentialID() string {
 	if p.clientID == "" {
-		return systemAssignedCredentialID
+		return hostDefaultCredentialID
 	}
 	return p.clientID
 }

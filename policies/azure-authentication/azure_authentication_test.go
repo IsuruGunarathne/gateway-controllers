@@ -533,7 +533,9 @@ func TestOnRequestHeadersRecordsManagedIdentityAuthContext(t *testing.T) {
 		wantCredentialID string
 	}{
 		{"user-assigned", map[string]interface{}{"authenticationType": "managed-identity", "clientId": testClientID}, testClientID},
-		{"system-assigned", map[string]interface{}{"authenticationType": "managed-identity"}, "system-assigned"},
+		// Without clientId, IMDS picks the host's system-assigned identity, or its only
+		// user-assigned identity, so the policy cannot tell which one it got.
+		{"host's default identity", map[string]interface{}{"authenticationType": "managed-identity"}, "host-default"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
