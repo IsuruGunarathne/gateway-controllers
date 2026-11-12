@@ -20,6 +20,7 @@ package azureauthentication
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -251,24 +252,72 @@ func TestTokenSourceSharesOneFetchAmongConcurrentCallers(t *testing.T) {
 	}
 }
 
-func TestTokenSourceDoesNotCacheFailures(t *testing.T) {
+// TestTokenSourceDoesNotCacheTransientFailures: a failure that may clear on its own is retried by
+// the next caller straight away.
+func TestTokenSourceDoesNotCacheTransientFailures(t *testing.T) {
+	for name, failure := range map[string]error{
+		"network error": errors.New("entra unavailable"),
+		"server error":  &tokenRequestError{kind: errKindEndpoint, status: http.StatusServiceUnavailable, retryable: true},
+		"throttled":     &tokenRequestError{kind: errKindEndpoint, status: http.StatusTooManyRequests, code: "temporarily_unavailable", retryable: true},
+		"timeout":       context.DeadlineExceeded,
+	} {
+		t.Run(name, func(t *testing.T) {
+			clock := &testClock{now: fixedNow}
+			f := &fakeFetcher{respond: func(_ context.Context, n int) (*accessToken, error) {
+				if n == 1 {
+					return nil, failure
+				}
+				return hourToken("tok-1", fixedNow), nil
+			}}
+			s := newTestSource(f, clock)
+
+			if _, err := s.Token(context.Background()); err == nil {
+				t.Fatal("expected the first fetch's error")
+			}
+			if got := mustToken(t, s); got != "tok-1" {
+				t.Fatalf("token = %q", got)
+			}
+			if n := f.callCount(); n != 2 {
+				t.Fatalf("fetches = %d, want 2", n)
+			}
+		})
+	}
+}
+
+// TestTokenSourceCachesARejectionBriefly: a rejection (a 4xx answer that is not throttling) is a
+// configuration error, so callers in the next couple of seconds get it without a new fetch.
+func TestTokenSourceCachesARejectionBriefly(t *testing.T) {
 	clock := &testClock{now: fixedNow}
+	rejected := &tokenRequestError{kind: errKindEndpoint, status: http.StatusUnauthorized, code: "invalid_client"}
 	f := &fakeFetcher{respond: func(_ context.Context, n int) (*accessToken, error) {
 		if n == 1 {
-			return nil, errors.New("entra unavailable")
+			return nil, rejected
 		}
-		return hourToken("tok-1", fixedNow), nil
+		return hourToken("tok-1", clock.Now()), nil
 	}}
 	s := newTestSource(f, clock)
+	var cached *cachedFailure
 
-	if _, err := s.Token(context.Background()); err == nil {
-		t.Fatal("expected the first fetch's error")
+	_, err := s.Token(context.Background())
+	if !errors.Is(err, rejected) || errors.As(err, &cached) {
+		t.Fatalf("first error = %v, want the fetch's own rejection", err)
 	}
+
+	clock.Set(fixedNow.Add(time.Second))
+	_, err = s.Token(context.Background())
+	if !errors.Is(err, rejected) || !errors.As(err, &cached) {
+		t.Fatalf("error within the window = %v, want the cached rejection", err)
+	}
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("fetches within the window = %d, want 1", n)
+	}
+
+	clock.Set(fixedNow.Add(3 * time.Second))
 	if got := mustToken(t, s); got != "tok-1" {
-		t.Fatalf("token = %q", got)
+		t.Fatalf("token after the window = %q", got)
 	}
 	if n := f.callCount(); n != 2 {
-		t.Fatalf("fetches = %d, want 2", n)
+		t.Fatalf("fetches after the window = %d, want 2", n)
 	}
 }
 

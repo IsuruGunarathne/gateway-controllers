@@ -227,7 +227,11 @@ there.
 4. The token is set in `headerName` (`Authorization: Bearer <token>` by default) and the request
    is forwarded upstream.
 5. If no token can be obtained, the request is short-circuited with `502 Bad Gateway`: it is the
-   gateway's own upstream credential that failed, not the client's.
+   gateway's own upstream credential that failed, not the client's. When Entra ID or IMDS rejects
+   the token request itself (a `4xx` answer other than `429`, such as `invalid_client` or "Identity
+   not found"), requests in the next 2 seconds or so get the same `502` without a new token
+   request, so a misconfigured identity doesn't send one for every API request. Other failures
+   aren't remembered.
 
 ## Reference Scenarios
 

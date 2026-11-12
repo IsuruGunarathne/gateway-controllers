@@ -19,7 +19,9 @@ package azureauthentication
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
@@ -32,6 +34,11 @@ const (
 	// backgroundRetryInterval is how long to wait after a failed background refresh before the
 	// next one. The cached token stays in use meanwhile.
 	backgroundRetryInterval = 30 * time.Second
+
+	// rejectionCacheFor is how long a rejected token request (see isRejection) is returned to
+	// callers without a new request, give or take a quarter for jitter. It keeps a misconfigured
+	// identity from sending Entra ID or the host's IMDS a token request for every API request.
+	rejectionCacheFor = 2 * time.Second
 )
 
 // tokenSource caches one access token for one identity and scope, and refreshes it.
@@ -43,7 +50,8 @@ const (
 //   - missing or expired: the caller waits for a fetch, shared with every other caller.
 //
 // Every fetch runs on its own context bounded by timeout, so a cancelled request never aborts a
-// fetch other requests are waiting on. Failures are not cached.
+// fetch other requests are waiting on. A rejected fetch is returned to callers for about
+// rejectionCacheFor without a new fetch; any other failure is not cached.
 type tokenSource struct {
 	fetcher  tokenFetcher
 	scope    string
@@ -55,6 +63,23 @@ type tokenSource struct {
 	tok                   *accessToken
 	inFlight              *fetchCall
 	nextBackgroundAttempt time.Time
+	rejection             error
+	rejectionUntil        time.Time
+}
+
+// cachedFailure is a recent rejection returned again without a new token request. It unwraps to
+// the rejection, so its fault reason is the same.
+type cachedFailure struct{ err error }
+
+func (c *cachedFailure) Error() string { return c.err.Error() }
+func (c *cachedFailure) Unwrap() error { return c.err }
+
+// isRejection reports whether err is a token endpoint refusing the request itself: a 4xx answer
+// that is not throttling, such as invalid_client or IMDS's "Identity not found". Only a
+// configuration change clears it, so it is worth caching; anything else may clear on its own.
+func isRejection(err error) bool {
+	var e *tokenRequestError
+	return errors.As(err, &e) && e.kind == errKindEndpoint && !e.retryable && e.status >= 400 && e.status < 500
 }
 
 // fetchCall is one fetch, shared by every caller that arrives while it runs.
@@ -85,6 +110,11 @@ func (s *tokenSource) Token(ctx context.Context) (*accessToken, error) {
 		s.mu.Unlock()
 		return tok, nil
 	}
+	if s.rejection != nil && now.Before(s.rejectionUntil) {
+		err := &cachedFailure{err: s.rejection}
+		s.mu.Unlock()
+		return nil, err
+	}
 	call := s.inFlight
 	if call == nil {
 		call = s.startFetchLocked(false)
@@ -111,11 +141,16 @@ func (s *tokenSource) startFetchLocked(background bool) *fetchCall {
 
 		s.mu.Lock()
 		s.inFlight = nil
-		if err == nil {
+		switch {
+		case err == nil:
 			s.tok = tok
 			s.nextBackgroundAttempt = time.Time{}
-		} else if background {
+			s.rejection = nil
+		case background:
 			s.nextBackgroundAttempt = s.now().Add(backgroundRetryInterval)
+		case isRejection(err):
+			s.rejection = err
+			s.rejectionUntil = s.now().Add(rejectionCacheFor*3/4 + rand.N(rejectionCacheFor/2+1))
 		}
 		s.mu.Unlock()
 		close(call.done)

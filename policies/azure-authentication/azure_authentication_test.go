@@ -388,6 +388,36 @@ func TestOnRequestHeadersFailureReturnsDeclaredFault(t *testing.T) {
 	}
 }
 
+// TestARejectionIsLoggedOnceWhileCached: requests that get a cached rejection fail the same way
+// but log at Debug, so a misconfigured identity logs one ERROR per token request, not per request.
+func TestARejectionIsLoggedOnceWhileCached(t *testing.T) {
+	setWorkloadIdentityEnv(t, "/token")
+	logs := captureLogs(t)
+	f := &fakeFetcher{respond: func(_ context.Context, _ int) (*accessToken, error) {
+		return nil, &tokenRequestError{kind: errKindEndpoint, status: http.StatusUnauthorized, code: "invalid_client"}
+	}}
+	useFetcher(t, func(identityConfig) tokenFetcher { return f })
+	p := mustGetPolicy(t, map[string]interface{}{"authenticationType": "workload-identity"})
+
+	for i := 0; i < 3; i++ {
+		resp, ok := p.OnRequestHeaders(context.Background(), newRequestHeaderContext(nil), nil).(policy.ImmediateResponse)
+		if !ok || resp.StatusCode != http.StatusBadGateway || resp.Fault == nil ||
+			resp.Fault.Description != "Microsoft Entra ID rejected the token request (invalid_client)" {
+			t.Fatalf("request %d: response = %+v, want the 502 for the rejection", i+1, resp)
+		}
+	}
+	if n := f.callCount(); n != 1 {
+		t.Fatalf("token requests = %d, want 1", n)
+	}
+	out := logs.String()
+	if n := strings.Count(out, "level=ERROR"); n != 1 {
+		t.Fatalf("ERROR lines = %d, want 1:\n%s", n, out)
+	}
+	if n := strings.Count(out, "could not obtain an access token from Microsoft Entra ID"); n != 3 {
+		t.Fatalf("failure log lines = %d, want 3 (1 ERROR, 2 Debug):\n%s", n, out)
+	}
+}
+
 func TestPoliciesWithTheSameIdentityShareOneToken(t *testing.T) {
 	setWorkloadIdentityEnv(t, "/token")
 	f := staticFetcher("tok-1")

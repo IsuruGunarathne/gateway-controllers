@@ -337,7 +337,13 @@ func (p *Policy) authFailure(reqCtx *policy.RequestHeaderContext, err error) pol
 	if reqCtx != nil && reqCtx.SharedContext != nil {
 		attrs = append(attrs, "requestId", reqCtx.RequestID, "apiName", reqCtx.APIName)
 	}
-	slog.Error("AzureAuthentication: could not obtain an access token from "+p.service.name, attrs...)
+	// A rejection served from the cache was logged at ERROR when its token request failed.
+	level := slog.LevelError
+	var cached *cachedFailure
+	if errors.As(err, &cached) {
+		level = slog.LevelDebug
+	}
+	slog.Log(context.Background(), level, "AzureAuthentication: could not obtain an access token from "+p.service.name, attrs...)
 
 	p.recordAuth(reqCtx, false)
 
